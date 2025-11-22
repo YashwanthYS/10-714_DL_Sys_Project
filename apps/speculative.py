@@ -13,6 +13,25 @@ import needle.nn as nn
 from needle.autograd import Tensor
 
 
+def _best_device():
+    """Prefer CUDA if available, else CPU."""
+    try:
+        cu = ndl.cuda()
+        if hasattr(cu, "enabled") and cu.enabled():
+            return cu
+    except Exception:
+        pass
+    return ndl.cpu()
+
+
+def _fmt_eta(start_time: float, step: int, total: int) -> str:
+    now = time.perf_counter()
+    elapsed = max(1e-6, now - start_time)
+    rate = step / elapsed if elapsed > 0 else 0.0
+    remain = (total - step) / rate if rate > 0 else 0.0
+    return f"elapsed={elapsed:.1f}s, eta={remain:.1f}s"
+
+
 def _to_tensor_ids(ids: List[int], device) -> Tensor:
     arr = np.array(ids, dtype=np.float32).reshape(1, -1)
     return Tensor(arr, device=device, dtype="float32", requires_grad=False)
@@ -28,7 +47,7 @@ class SpeculativeDecoder:
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.k = k
-        self.device = device if device is not None else ndl.cpu()
+        self.device = device if device is not None else _best_device()
 
         # Draft model: 1 layer, d=96
         dD = 96
@@ -182,7 +201,7 @@ class CopyTaskTrainer:
     Objective: predict next token equal to current token.
     """
     def __init__(self, device=None):
-        self.device = device if device is not None else ndl.cpu()
+        self.device = device if device is not None else _best_device()
 
     def _batch(self, vocab_size: int, seq_len: int, batch_size: int) -> Tuple[Tensor, Tensor]:
         X = np.random.randint(0, vocab_size, size=(batch_size, seq_len), dtype=np.int32)
@@ -193,11 +212,13 @@ class CopyTaskTrainer:
         tgt_t = Tensor(tgt.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
         return inp_t, tgt_t
 
-    def train_model(self, model: nn.Module, vocab_size: int, seq_len: int = 32, batch_size: int = 16, steps: int = 200, lr: float = 1e-3):
+    def train_model(self, model: nn.Module, vocab_size: int, seq_len: int = 32, batch_size: int = 16, steps: int = 200, lr: float = 1e-3, name: str = "train"):
         optim = ndl.optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
         loss_fn = nn.SoftmaxLoss()
         model.train()
-        for _ in range(steps):
+        start = time.perf_counter()
+        last_bucket = -1
+        for it in range(steps):
             inp, tgt = self._batch(vocab_size, seq_len, batch_size)
             logits, _ = model(inp)  # (B, T-1, V)
             B, Tm1, V = logits.shape
@@ -208,11 +229,16 @@ class CopyTaskTrainer:
             optim.reset_grad()
             loss.backward()
             optim.step()
+            # progress log every ~5% or at end
+            bucket = int((it + 1) * 20 / steps)
+            if bucket != last_bucket or it + 1 == steps:
+                last_bucket = bucket
+                print(f"[{name}] step {it+1}/{steps}, loss={float(loss.numpy()):.4f}, {_fmt_eta(start, it+1, steps)}")
 
     def train_both(self, decoder: 'SpeculativeDecoder', vocab_size: int, seq_len: int = 32, batch_size: int = 16, steps: int = 200, lr: float = 1e-3):
         # Train draft and verify on same task for better agreement
-        self.train_model(decoder.draft, vocab_size, seq_len, batch_size, steps, lr)
-        self.train_model(decoder.verify, vocab_size, seq_len, batch_size, steps, lr)
+        self.train_model(decoder.draft, vocab_size, seq_len, batch_size, steps, lr, name="draft")
+        self.train_model(decoder.verify, vocab_size, seq_len, batch_size, steps, lr, name="verify")
 
 
 def profile_k(decoder: SpeculativeDecoder, prompt_ids: List[int], gen_tokens: int, ks: List[int]) -> List[dict]:
@@ -248,10 +274,11 @@ class TinyCharTokenizer:
 
 def run_copy_demo(args):
     np.random.seed(args.seed)
-    device = ndl.cpu()
+    device = _best_device()
     vocab = args.vocab_size
     max_len = args.max_seq_len
     decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device)
+    print(f"Using device: {device}")
 
     # Optional: quick copy-task training to improve acceptance
     trainer = CopyTaskTrainer(device=device)
@@ -279,14 +306,16 @@ def run_copy_demo(args):
 
 class CharLMTrainer:
     def __init__(self, device=None):
-        self.device = device if device is not None else ndl.cpu()
+        self.device = device if device is not None else _best_device()
 
-    def train_model(self, model: nn.Module, data_ids: np.ndarray, vocab_size: int, seq_len: int = 64, batch_size: int = 32, steps: int = 1000, lr: float = 1e-3):
+    def train_model(self, model: nn.Module, data_ids: np.ndarray, vocab_size: int, seq_len: int = 64, batch_size: int = 32, steps: int = 1000, lr: float = 1e-3, name: str = "train"):
         optim = ndl.optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
         loss_fn = nn.SoftmaxLoss()
         N = data_ids.shape[0]
         model.train()
-        for _ in range(steps):
+        start = time.perf_counter()
+        last_bucket = -1
+        for it in range(steps):
             # sample start positions uniformly
             if N <= seq_len:
                 start_idx = [0] * batch_size
@@ -303,6 +332,10 @@ class CharLMTrainer:
             optim.reset_grad()
             loss.backward()
             optim.step()
+            bucket = int((it + 1) * 20 / steps)
+            if bucket != last_bucket or it + 1 == steps:
+                last_bucket = bucket
+                print(f"[{name}] step {it+1}/{steps}, loss={float(loss.numpy()):.4f}, {_fmt_eta(start, it+1, steps)}")
 
     def align_draft_to_verify(
         self,
@@ -321,7 +354,9 @@ class CharLMTrainer:
         optim = ndl.optim.Adam(decoder.draft.parameters(), lr=lr, weight_decay=0.0)
         ce = nn.SoftmaxLoss()
         N = data_ids.shape[0]
-        for _ in range(steps):
+        start = time.perf_counter()
+        last_bucket = -1
+        for it in range(steps):
             if N <= seq_len:
                 start_idx = [0] * batch_size
             else:
@@ -347,6 +382,10 @@ class CharLMTrainer:
             optim.reset_grad()
             loss.backward()
             optim.step()
+            bucket = int((it + 1) * 20 / steps)
+            if bucket != last_bucket or it + 1 == steps:
+                last_bucket = bucket
+                print(f"[align] step {it+1}/{steps}, loss={float(loss.numpy()):.4f}, {_fmt_eta(start, it+1, steps)}")
 
 
 class CorpusCharTokenizer:
@@ -374,7 +413,7 @@ class CorpusCharTokenizer:
 
 def run_char_demo(args):
     np.random.seed(args.seed)
-    device = ndl.cpu()
+    device = _best_device()
     # Load corpus
     path = args.ptb_path if args.ptb_path else os.path.join("data", "ptb", "train.txt")
     with open(path, "r", encoding="utf-8") as f:
@@ -384,11 +423,12 @@ def run_char_demo(args):
     vocab = tok.vocab_size
     max_len = args.max_seq_len
     decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device)
+    print(f"Using device: {device}")
 
     # Train both models on char LM
     trainer = CharLMTrainer(device=device)
-    trainer.train_model(decoder.draft, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr)
-    trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr)
+    trainer.train_model(decoder.draft, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="draft")
+    trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="verify")
     # Optional alignment for higher acceptance
     if args.align_steps > 0:
         trainer.align_draft_to_verify(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.align_steps, lr=args.lr, alpha=args.align_alpha)
