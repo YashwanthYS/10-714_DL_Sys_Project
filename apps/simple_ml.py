@@ -14,7 +14,7 @@ from apps.models import *
 import time
 device = ndl.cpu()
 
-def parse_mnist(image_filesname, label_filename):
+def parse_mnist(image_filename, label_filename):
     """Read an images and labels file in MNIST format.  See this page:
     http://yann.lecun.com/exdb/mnist/ for a description of the file format.
 
@@ -65,7 +65,7 @@ def softmax_loss(Z, y_one_hot):
 def nn_epoch(X, y, W1, W2, lr=0.1, batch=100):
     """Run a single epoch of SGD for a two-layer neural network defined by the
     weights W1 and W2 (with no bias terms):
-        logits = ReLU(X * W1) * W1
+        logits = ReLU(X * W1) * W2
     The function should use the step size lr, and the specified batch size (and
     again, without randomizing the order of X).
 
@@ -180,7 +180,38 @@ def epoch_general_ptb(data, model, seq_len=40, loss_fn=nn.SoftmaxLoss(), opt=Non
     """
     np.random.seed(4)
     ### BEGIN YOUR SOLUTION
-    raise NotImplementedError()
+    if opt is None:
+        model.eval()
+    else:
+        model.train()
+
+    nbatch, batch_size = data.shape
+    total_correct = 0
+    total_count = 0
+    total_loss = 0.0
+
+    i = 0
+    while i < nbatch - 1:
+        X, y = ndl.data.get_batch(data, i, seq_len, device=device, dtype=dtype)
+        logits, _ = model(X, None)  # reset hidden state each chunk
+        # accuracy
+        pred = np.argmax(logits.numpy(), axis=1)
+        y_np = y.numpy().astype(np.int32)
+        total_correct += np.sum(pred == y_np)
+        total_count += y.shape[0]
+
+        loss = loss_fn(logits, y)
+        total_loss += float(loss.numpy()) * y.shape[0]
+
+        if opt is not None:
+            opt.reset_grad()
+            loss.backward()
+            opt.step()
+        i += seq_len
+
+    avg_acc = total_correct / total_count if total_count > 0 else 0.0
+    avg_loss = total_loss / total_count if total_count > 0 else 0.0
+    return avg_acc, avg_loss
     ### END YOUR SOLUTION
 
 
@@ -207,7 +238,11 @@ def train_ptb(model, data, seq_len=40, n_epochs=1, optimizer=ndl.optim.SGD,
     """
     np.random.seed(4)
     ### BEGIN YOUR SOLUTION
-    raise NotImplementedError()
+    opt = optimizer(model.parameters(), lr=lr, weight_decay=weight_decay)
+    avg_acc, avg_loss = 0.0, 0.0
+    for _ in range(n_epochs):
+        avg_acc, avg_loss = epoch_general_ptb(data, model, seq_len=seq_len, loss_fn=loss_fn(), opt=opt, clip=clip, device=device, dtype=dtype)
+    return avg_acc, avg_loss
     ### END YOUR SOLUTION
 
 def evaluate_ptb(model, data, seq_len=40, loss_fn=nn.SoftmaxLoss,
@@ -227,7 +262,7 @@ def evaluate_ptb(model, data, seq_len=40, loss_fn=nn.SoftmaxLoss,
     """
     np.random.seed(4)
     ### BEGIN YOUR SOLUTION
-    raise NotImplementedError()
+    return epoch_general_ptb(data, model, seq_len=seq_len, loss_fn=loss_fn(), opt=None, device=device, dtype=dtype)
     ### END YOUR SOLUTION
 
 ### CODE BELOW IS FOR ILLUSTRATION, YOU DO NOT NEED TO EDIT

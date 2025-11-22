@@ -52,21 +52,19 @@ class MultiHeadAttention(Module):
         """
         batched matrix multiplication;
         """
-        a_shape = (*a.shape[:-1], 1, *a.shape[-1:])
-        a = a.reshape(a_shape)
+        # a: (B, H, Tq, D); b_transpose: (B, H, D, Tk)
+        B, H, Tq, D = a.shape
+        _, _, D2, Tk = b_transpose.shape
+        assert D == D2
 
-        b_transpose_shape = (*b_transpose.shape[:-2], 1, *b_transpose.shape[-2:])
-        b_transpose = b_transpose.reshape(b_transpose_shape)
+        A3 = a.reshape((B * H, Tq, D))
+        B3 = b_transpose.reshape((B * H, D, Tk))
 
-        broadcast_shape = list(a_shape)
-        broadcast_shape[-2] = b_transpose_shape[-2]
-        a = a.broadcast_to(broadcast_shape)
-
-        broadcast_shape = list(b_transpose_shape)
-        broadcast_shape[-3] = a_shape[-3]
-        b_transpose = b_transpose.broadcast_to(broadcast_shape)
-
-        return (a * b_transpose).sum(len(a.shape) - 1)
+        As = [t for t in ops.split(A3, axis=0)]
+        Bs = [t for t in ops.split(B3, axis=0)]
+        outs = [ops.matmul(x, y) for x, y in zip(As, Bs)]
+        C = ops.stack(outs, axis=0)
+        return C.reshape((B, H, Tq, Tk))
 
     def softmax(self, logit):
         """
@@ -109,7 +107,24 @@ class MultiHeadAttention(Module):
         probs = None
 
         ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
+        # Attention scores: (B, H, Tq, Tk)
+        # Use a Python float to trigger scalar multiply (no broadcasting for 0-d tensors)
+        inv_scale = float(1.0 / np.sqrt(np.float32(q_dim)))
+        scores = self.matmul(q, ops.transpose(k)) * inv_scale
+
+        # Causal mask if enabled
+        if self.causal:
+            mask_nd = self.create_causal_mask(queries_len, keys_values_len, q.device)
+            mask = Tensor(mask_nd, device=q.device, dtype=q.dtype, requires_grad=False)
+            mask = ops.broadcast_to(mask, scores.shape)
+            scores = scores + mask
+
+        # Softmax over last dim and apply dropout
+        probs = self.softmax(scores)
+        probs = self.dropout(probs)
+
+        # Weighted sum of values: (B, H, Tq, D)
+        result = self.matmul(probs, v)
         ### END YOUR SOLUTION
 
         return result, probs
@@ -203,7 +218,46 @@ class AttentionLayer(Module):
         result = None
 
         ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
+        # Prenorm and linear projections
+        inner_dim = self.num_head * self.dim_head
+
+        # Flatten (B, T, D) -> (B*T, D) for LayerNorm and Linear (2D ops)
+        B, Tq, _ = q.shape
+        _, Tk, _ = k.shape
+        _, Tv, _ = v.shape
+
+        q_flat = q.reshape((B * Tq, q_dim))
+        k_flat = k.reshape((B * Tk, k_dim))
+        v_flat = v.reshape((B * Tv, v_dim))
+
+        qn = self.prenorm_q(q_flat)
+        kn = self.prenorm_k(k_flat)
+        vn = self.prenorm_v(v_flat)
+
+        qp = self.q_projection(qn)  # (B*Tq, H*D)
+        kp = self.k_projection(kn)  # (B*Tk, H*D)
+        vp = self.v_projection(vn)  # (B*Tv, H*D)
+
+        # Restore time dim and split heads: (B, T, H, D) -> (B, H, T, D)
+        qp = qp.reshape((B, Tq, inner_dim)).reshape((B, Tq, self.num_head, self.dim_head))
+        kp = kp.reshape((B, Tk, inner_dim)).reshape((B, Tk, self.num_head, self.dim_head))
+        vp = vp.reshape((B, Tv, inner_dim)).reshape((B, Tv, self.num_head, self.dim_head))
+
+        qp = ops.transpose(qp, axes=(1, 2))
+        kp = ops.transpose(kp, axes=(1, 2))
+        vp = ops.transpose(vp, axes=(1, 2))
+
+        # Multi-head attention activation
+        attn_out, probs = self.attn(qp, kp, vp)  # (B, H, Tq, D)
+        self.probs = probs
+
+        # Merge heads back: (B, Tq, H*D)
+        attn_out = ops.transpose(attn_out, axes=(1, 2))  # (B, Tq, H, D)
+        attn_out = attn_out.reshape((B * Tq, inner_dim))
+
+        # Output projection to requested features, then reshape back to (B, Tq, out)
+        result = self.out_projection(attn_out)
+        result = result.reshape((B, Tq, self.out_features))
         ### END YOUR SOLUTION
 
         return result
@@ -230,7 +284,23 @@ class TransformerLayer(Module):
         self.dtype = dtype
 
         ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
+        self.attn = AttentionLayer(
+            q_features,
+            num_head,
+            dim_head,
+            dropout=dropout,
+            causal=causal,
+            device=device,
+            dtype=dtype,
+        )
+
+        # Feed-forward block (prenorm variant)
+        self.ff_norm = LayerNorm1d(q_features, device=device, dtype=dtype)
+        self.ff_linear1 = Linear(q_features, hidden_size, device=device, dtype=dtype)
+        self.ff_linear2 = Linear(hidden_size, q_features, device=device, dtype=dtype)
+        self.relu = ReLU()
+        self.dropout = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
         ### END YOUR SOLUTION
 
     def forward(
@@ -246,7 +316,21 @@ class TransformerLayer(Module):
         batch_size, seq_len, x_dim = x.shape
 
         ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
+        # Self-attention with residual and dropout
+        attn_out = self.attn(x)  # (B, T, D)
+        x = x + self.dropout(attn_out)
+
+        # Feed-forward with prenorm, residual, and dropout
+        B, T, D = x.shape
+        y = x.reshape((B * T, D))
+        y = self.ff_norm(y)
+        y = self.ff_linear1(y)
+        y = self.relu(y)
+        y = self.dropout(y)
+        y = self.ff_linear2(y)
+        y = self.dropout2(y)
+        y = y.reshape((B, T, D))
+        x = x + y
         ### END YOUR SOLUTION
 
         return x
@@ -277,7 +361,28 @@ class Transformer(Module):
         self.batch_first = batch_first
 
         ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
+        self.sequence_len = sequence_len
+        self.num_layers = num_layers
+        self.embedding_size = embedding_size
+
+        # Positional embedding (learned)
+        self.pos_embedding = Embedding(sequence_len, embedding_size, device=device, dtype=dtype)
+
+        # Transformer layers
+        self.layers: List[TransformerLayer] = []
+        for _ in range(num_layers):
+            self.layers.append(
+                TransformerLayer(
+                    q_features=embedding_size,
+                    num_head=num_head,
+                    dim_head=dim_head,
+                    hidden_size=hidden_size,
+                    dropout=dropout,
+                    causal=causal,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
         ### END YOUR SOLUTION
 
     def forward(
@@ -289,7 +394,19 @@ class Transformer(Module):
             x = ops.transpose(x, axes=(0, 1))
 
         ### BEGIN YOUR SOLUTION
-        raise NotImplementedError()
+        # x: (B, T, D)
+        B, T, D = x.shape
+
+        # Build positional indices of shape (T, B)
+        pos = np.tile(np.arange(T, dtype=np.int32).reshape(T, 1), (1, B))
+        pos_t = Tensor(pos.astype("float32"), device=x.device, dtype="float32", requires_grad=False)
+        pos_emb = self.pos_embedding(pos_t)  # (T, B, D)
+        pos_emb_bt = ops.transpose(pos_emb, axes=(0, 1))  # (B, T, D)
+
+        x = x + pos_emb_bt
+
+        for layer in self.layers:
+            x = layer(x)
         ### END YOUR SOLUTION
 
         if not self.batch_first:
