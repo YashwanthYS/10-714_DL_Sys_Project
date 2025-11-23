@@ -10,6 +10,7 @@ sys.path.append("python")
 
 import needle as ndl
 import needle.nn as nn
+from needle import ops
 from needle.autograd import Tensor
 
 
