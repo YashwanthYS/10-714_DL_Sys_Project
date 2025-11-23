@@ -32,6 +32,17 @@ def _fmt_eta(start_time: float, step: int, total: int) -> str:
     return f"elapsed={elapsed:.1f}s, eta={remain:.1f}s"
 
 
+def _to_float(t: Tensor) -> float:
+    """Robustly convert scalar-like Tensor to Python float without deprecation warnings."""
+    arr = t.numpy()
+    try:
+        return float(arr.reshape(-1)[0])
+    except Exception:
+        # Fallback: use mean if unexpectedly non-scalar
+        import numpy as _np
+        return float(_np.asarray(arr).mean())
+
+
 def _to_tensor_ids(ids: List[int], device) -> Tensor:
     arr = np.array(ids, dtype=np.float32).reshape(1, -1)
     return Tensor(arr, device=device, dtype="float32", requires_grad=False)
@@ -233,7 +244,7 @@ class CopyTaskTrainer:
             bucket = int((it + 1) * 20 / steps)
             if bucket != last_bucket or it + 1 == steps:
                 last_bucket = bucket
-                print(f"[{name}] step {it+1}/{steps}, loss={float(loss.numpy()):.4f}, {_fmt_eta(start, it+1, steps)}")
+                print(f"[{name}] step {it+1}/{steps}, loss={_to_float(loss):.4f}, {_fmt_eta(start, it+1, steps)}")
 
     def train_both(self, decoder: 'SpeculativeDecoder', vocab_size: int, seq_len: int = 32, batch_size: int = 16, steps: int = 200, lr: float = 1e-3):
         # Train draft and verify on same task for better agreement
@@ -335,7 +346,7 @@ class CharLMTrainer:
             bucket = int((it + 1) * 20 / steps)
             if bucket != last_bucket or it + 1 == steps:
                 last_bucket = bucket
-                print(f"[{name}] step {it+1}/{steps}, loss={float(loss.numpy()):.4f}, {_fmt_eta(start, it+1, steps)}")
+                print(f"[{name}] step {it+1}/{steps}, loss={_to_float(loss):.4f}, {_fmt_eta(start, it+1, steps)}")
 
     def align_draft_to_verify(
         self,
@@ -385,7 +396,7 @@ class CharLMTrainer:
             bucket = int((it + 1) * 20 / steps)
             if bucket != last_bucket or it + 1 == steps:
                 last_bucket = bucket
-                print(f"[align] step {it+1}/{steps}, loss={float(loss.numpy()):.4f}, {_fmt_eta(start, it+1, steps)}")
+                print(f"[align] step {it+1}/{steps}, loss={_to_float(loss):.4f}, {_fmt_eta(start, it+1, steps)}")
 
 
 class CorpusCharTokenizer:

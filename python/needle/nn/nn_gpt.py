@@ -102,31 +102,36 @@ class CausalSelfAttention(Module):
         k = ops.transpose(k, axes=(1, 2))
         v = ops.transpose(v, axes=(1, 2))
 
-        # Build K/V over full context using cache lists
-        k_list: List[Tensor] = []
-        v_list: List[Tensor] = []
+        # Build K/V over context
+        use_cache = cache is not None
         T_prev = 0
-        if cache is not None and cache.get("k"):
-            k_list.extend(cache["k"])  # elements (B, H, 1, Dh)
-            v_list.extend(cache["v"])
-            T_prev = len(k_list)
+        if use_cache and cache.get("k"):
+            T_prev = len(cache["k"])  # tokens already cached
 
-        # Split current k,v along time and append
-        if T_new == 1:
-            # store slices as (B,H,Dh) consistently
-            k_slices = [k.reshape((B, H, Dh))]
-            v_slices = [v.reshape((B, H, Dh))]
+        if use_cache:
+            # Append current block as slices for incremental decoding
+            k_list: List[Tensor] = []
+            v_list: List[Tensor] = []
+            if cache.get("k"):
+                k_list.extend(cache["k"])  # elements (B,H,Dh)
+                v_list.extend(cache["v"])  # elements (B,H,Dh)
+
+            if T_new == 1:
+                k_slices = [k.reshape((B, H, Dh))]
+                v_slices = [v.reshape((B, H, Dh))]
+            else:
+                k_slices = [t for t in ops.split(k, axis=2)]
+                v_slices = [t for t in ops.split(v, axis=2)]
+
+            k_list.extend(k_slices)
+            v_list.extend(v_slices)
+
+            K_all = ops.stack(k_list, axis=2)
+            V_all = ops.stack(v_list, axis=2)
         else:
-            # ops.split squeezes the split axis; we get (B,H,Dh)
-            k_slices = [t for t in ops.split(k, axis=2)]
-            v_slices = [t for t in ops.split(v, axis=2)]
-
-        k_list.extend(k_slices)
-        v_list.extend(v_slices)
-
-        # Stack into (B,H,Tk,Dh)
-        K_all = ops.stack(k_list, axis=2)
-        V_all = ops.stack(v_list, axis=2)
+            # Training/full-block case: avoid per-time slicing/lists
+            K_all = k
+            V_all = v
 
         # Compute attention for the new T_new queries only
         inv_scale = float(1.0 / np.sqrt(np.float32(Dh)))
@@ -157,10 +162,7 @@ class CausalSelfAttention(Module):
         out = out.reshape((B, T_new, D))
 
         # Prepare updated cache
-        new_cache = {
-            "k": k_list,
-            "v": v_list,
-        }
+        new_cache = {"k": k_list, "v": v_list} if use_cache else {"k": [], "v": []}
         return out, new_cache
 
 
@@ -266,15 +268,19 @@ class GPTModel(Module):
         h = h + pos_emb
         h = self.dropout(h)
 
-        # Prepare cache
+        # Prepare cache: avoid building caches during training to save memory
         if cache is None:
-            cache = self.init_cache(B)
+            if self.training:
+                cache = [None] * self.num_layers  # signal no caching
+            else:
+                cache = self.init_cache(B)
 
         # Pass through blocks with caching
         new_cache: List[Dict[str, List[Tensor]]] = []
         out = h
         for i, layer in enumerate(self.layers):
-            out, layer_cache = layer(out, cache[i])
+            layer_cache_in = None if (isinstance(cache, list) and len(cache) > i and cache[i] is None) else cache[i]
+            out, layer_cache = layer(out, layer_cache_in)
             new_cache.append(layer_cache)
 
         # Final layer norm and logits via tied embedding weight
