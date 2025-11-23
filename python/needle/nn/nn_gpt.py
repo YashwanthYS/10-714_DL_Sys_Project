@@ -257,7 +257,7 @@ class GPTModel(Module):
         tok_TBD = self.token_embedding(x_TB)
         # Determine absolute position offset from cache length
         pos_offset = 0
-        if cache is not None and len(cache) > 0 and cache[0].get("k"):
+        if cache and len(cache) > 0 and isinstance(cache[0], dict) and cache[0].get("k"):
             pos_offset = len(cache[0]["k"])  # tokens already cached
         # Positional indices shape (T, B) with offset
         pos_idx = np.tile((np.arange(T, dtype=np.int32) + pos_offset).reshape(T, 1), (1, B))

@@ -39,7 +39,12 @@ class CPUDevice(Device):
         return numpy.random.rand(*shape)
 
     def one_hot(self, n, i, dtype="float32"):
-        return numpy.eye(n, dtype=dtype)[i]
+        # Efficient one-hot without building full identity
+        idx = numpy.asarray(i, dtype=numpy.int64).reshape(-1)
+        m = idx.shape[0]
+        out = numpy.zeros((m, n), dtype=dtype)
+        out[numpy.arange(m, dtype=numpy.int64), idx] = 1
+        return out
 
     def empty(self, shape, dtype="float32"):
         return numpy.empty(shape, dtype=dtype)

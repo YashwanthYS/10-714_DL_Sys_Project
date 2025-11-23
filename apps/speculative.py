@@ -54,20 +54,21 @@ def _argmax_last(logits_2d: np.ndarray) -> int:
 
 
 class SpeculativeDecoder:
-    def __init__(self, vocab_size=1000, max_seq_len=128, k=3, device=None, draft_model: nn.Module=None, verify_model: nn.Module=None):
+    def __init__(self, vocab_size=1000, max_seq_len=128, k=3, device=None, draft_model: nn.Module=None, verify_model: nn.Module=None,
+                 draft_embed: int = 96, draft_layers: int = 1, verify_embed: int = 128, verify_layers: int = 2, num_heads: int = 4):
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.k = k
         self.device = device if device is not None else _best_device()
 
-        # Draft model: 1 layer, d=96
-        dD = 96
-        H_D = 4
+        # Draft model (configurable)
+        dD = draft_embed
+        H_D = num_heads
         Dh_D = dD // H_D
         self.draft = draft_model or nn.GPTModel(
             vocab_size=vocab_size,
             embed_dim=dD,
-            num_layers=1,
+            num_layers=draft_layers,
             num_head=H_D,
             dim_head=Dh_D,
             mlp_hidden=4 * dD,
@@ -78,14 +79,14 @@ class SpeculativeDecoder:
             batch_first=True,
         )
 
-        # Verifier model: 2 layers, d=128
-        dV = 128
-        H_V = 4
+        # Verifier model (configurable)
+        dV = verify_embed
+        H_V = num_heads
         Dh_V = dV // H_V
         self.verify = verify_model or nn.GPTModel(
             vocab_size=vocab_size,
             embed_dim=dV,
-            num_layers=2,
+            num_layers=verify_layers,
             num_head=H_V,
             dim_head=Dh_V,
             mlp_hidden=4 * dV,
@@ -288,7 +289,9 @@ def run_copy_demo(args):
     device = _best_device()
     vocab = args.vocab_size
     max_len = args.max_seq_len
-    decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device)
+    decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device,
+                                 draft_embed=args.draft_embed, draft_layers=args.draft_layers,
+                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers)
     print(f"Using device: {device}")
 
     # Optional: quick copy-task training to improve acceptance
@@ -358,9 +361,10 @@ class CharLMTrainer:
         steps: int = 200,
         lr: float = 1e-3,
         alpha: float = 0.5,
+        temperature: float = 1.0,
     ):
         """Knowledge distillation-style alignment: train draft to match verifier.
-        Loss = alpha * CE(draft, true) + (1-alpha) * CE(draft, teacher_argmax)
+        Loss = alpha * CE(draft, true) + (1-alpha) * CE_soft(draft, softmax(verify/temperature))
         """
         optim = ndl.optim.Adam(decoder.draft.parameters(), lr=lr, weight_decay=0.0)
         ce = nn.SoftmaxLoss()
@@ -378,18 +382,29 @@ class CharLMTrainer:
             inp_t = Tensor(inp.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
             tgt_t = Tensor(tgt.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
 
-            # Teacher predictions (no grad – use numpy)
-            with np.errstate(all='ignore'):
-                logits_v, _ = decoder.verify(inp_t)
-            pred_v = np.argmax(logits_v.numpy(), axis=2).astype(np.int32)
-            teacher_t = Tensor(pred_v.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
+            # Teacher logits (no grad) and soft probabilities
+            logits_v, _ = decoder.verify(inp_t)
+            Bv, Tv, V = logits_v.shape
+            lv2 = logits_v.reshape((Bv * Tv, V))
+            if temperature != 1.0:
+                lv2 = lv2 / temperature
+            logsum = ops.logsumexp(lv2, axes=(1,)).reshape((Bv * Tv, 1))
+            teacher_log_probs = lv2 - ops.broadcast_to(logsum, lv2.shape)
+            teacher_probs = ops.exp(teacher_log_probs).detach()
 
             # Student (draft)
             logits_d, _ = decoder.draft(inp_t)
             B, Tm1, V = logits_d.shape
-            loss_true = ce(logits_d.reshape((B * Tm1, V)), tgt_t.reshape((B * Tm1,)))
-            loss_teacher = ce(logits_d.reshape((B * Tm1, V)), teacher_t.reshape((B * Tm1,)))
-            loss = loss_true * alpha + loss_teacher * (1.0 - alpha)
+            ld2 = logits_d.reshape((B * Tm1, V))
+            ls = ld2 if temperature == 1.0 else (ld2 / temperature)
+            logsum_s = ops.logsumexp(ls, axes=(1,)).reshape((B * Tm1, 1))
+            student_log_probs = ls - ops.broadcast_to(logsum_s, ls.shape)
+
+            # Hard CE with true target
+            loss_true = ce(ld2, tgt_t.reshape((B * Tm1,)))
+            # Soft CE with teacher probs
+            soft_ce = -ops.summation(teacher_probs * student_log_probs) / (B * Tm1)
+            loss = loss_true * alpha + soft_ce * (1.0 - alpha)
             optim.reset_grad()
             loss.backward()
             optim.step()
@@ -422,6 +437,38 @@ class CorpusCharTokenizer:
         return "".join(self.itos[i % len(self.itos)] for i in ids)
 
 
+class CorpusWordTokenizer:
+    def __init__(self, text: str, vocab_size: int = 10000, lowercase: bool = True):
+        if lowercase:
+            text = text.lower()
+        # simple whitespace tokenization
+        tokens = text.split()
+        # count frequencies
+        freq = {}
+        for t in tokens:
+            freq[t] = freq.get(t, 0) + 1
+        # reserve special tokens
+        specials = ["<unk>"]
+        # sort by frequency then lexicographically
+        sorted_words = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+        words = [w for w, _ in sorted_words]
+        trimmed = words[: max(0, vocab_size - len(specials))]
+        self.itos = specials + trimmed
+        self.stoi = {w: i for i, w in enumerate(self.itos)}
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.itos)
+
+    def encode(self, text: str) -> List[int]:
+        toks = text.lower().split()
+        unk = self.stoi.get("<unk>")
+        return [self.stoi.get(t, unk) for t in toks]
+
+    def decode(self, ids: List[int]) -> str:
+        return " ".join(self.itos[i % len(self.itos)] for i in ids)
+
+
 def run_char_demo(args):
     np.random.seed(args.seed)
     device = _best_device()
@@ -433,7 +480,9 @@ def run_char_demo(args):
     data_ids = np.array(tok.encode(text), dtype=np.int32)
     vocab = tok.vocab_size
     max_len = args.max_seq_len
-    decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device)
+    decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device,
+                                 draft_embed=args.draft_embed, draft_layers=args.draft_layers,
+                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers)
     print(f"Using device: {device}")
 
     # Train both models on char LM
@@ -442,7 +491,8 @@ def run_char_demo(args):
     trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="verify")
     # Optional alignment for higher acceptance
     if args.align_steps > 0:
-        trainer.align_draft_to_verify(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.align_steps, lr=args.lr, alpha=args.align_alpha)
+        trainer.align_draft_to_verify(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size,
+                                      steps=args.align_steps, lr=args.lr, alpha=args.align_alpha, temperature=args.align_temp)
 
     # Prompt
     prompt_text = args.prompt if args.prompt else "the quick brown fox "
@@ -464,9 +514,53 @@ def run_char_demo(args):
             print(f"  k={row['k']}: tokens/sec={row['toks_per_s']:.2f}, acceptance={row['accept_rate']:.2f}, p50_ms={row['p50_ms']:.1f}")
 
 
+def run_word_demo(args):
+    np.random.seed(args.seed)
+    device = _best_device()
+    # Load corpus
+    path = args.ptb_path if args.ptb_path else os.path.join("data", "ptb", "train.txt")
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    tok = CorpusWordTokenizer(text, vocab_size=args.word_vocab_size, lowercase=True)
+    data_ids = np.array(tok.encode(text), dtype=np.int32)
+    vocab = tok.vocab_size
+    max_len = args.max_seq_len
+    decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device,
+                                 draft_embed=args.draft_embed, draft_layers=args.draft_layers,
+                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers)
+    print(f"Using device: {device}")
+
+    # Train both models on word LM
+    trainer = CharLMTrainer(device=device)
+    trainer.train_model(decoder.draft, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="draft")
+    trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="verify")
+    if args.align_steps > 0:
+        trainer.align_draft_to_verify(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size,
+                                      steps=args.align_steps, lr=args.lr, alpha=args.align_alpha, temperature=args.align_temp)
+
+    # Prompt
+    prompt_text = args.prompt if args.prompt else "the quick brown fox"
+    prompt_ids = tok.encode(prompt_text)
+    out, metrics = decoder.decode(prompt_ids, gen_tokens=args.gen_tokens)
+    print("Prompt text:", prompt_text)
+    print("Prompt ids:", prompt_ids)
+    print("Output (ids):", out)
+    print("Output text:", tok.decode(out))
+    print("Metrics:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+
+    if args.profile_k:
+        ks = args.ks if args.ks else [2,3,4]
+        print(f"\nProfile across k in {ks}:")
+        table = profile_k(decoder, prompt_ids, gen_tokens=args.gen_tokens, ks=ks)
+        for row in table:
+            print(f"  k={row['k']}: tokens/sec={row['toks_per_s']:.2f}, acceptance={row['accept_rate']:.2f}, p50_ms={row['p50_ms']:.1f}")
+
+
 def main_demo():
     parser = argparse.ArgumentParser(description="Speculative decoding demo")
-    parser.add_argument("--mode", choices=["copy", "char"], default="copy")
+    parser.add_argument("--mode", choices=["copy", "char", "word", "token"], default="copy")
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--seq-len", type=int, default=32)
@@ -477,17 +571,25 @@ def main_demo():
     parser.add_argument("--ks", type=int, nargs="*", default=None)
     parser.add_argument("--ptb-path", type=str, default="")
     parser.add_argument("--vocab-size", type=int, default=1000)
+    parser.add_argument("--word-vocab-size", type=int, default=10000, help="vocab cap for word tokenizer mode")
     parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--align-steps", type=int, default=0, help="extra alignment steps (KD) for draft vs verifier (char mode)")
     parser.add_argument("--align-alpha", type=float, default=0.5, help="weight on true CE vs teacher CE in alignment (char mode)")
+    parser.add_argument("--align-temp", type=float, default=1.0, help="temperature for teacher softmax in alignment")
+    parser.add_argument("--draft-embed", type=int, default=96)
+    parser.add_argument("--verify-embed", type=int, default=128)
+    parser.add_argument("--draft-layers", type=int, default=1)
+    parser.add_argument("--verify-layers", type=int, default=2)
     args = parser.parse_args()
 
     if args.mode == "copy":
         run_copy_demo(args)
-    else:
+    elif args.mode == "char":
         run_char_demo(args)
+    else:  # word or token
+        run_word_demo(args)
 
 
 if __name__ == "__main__":
