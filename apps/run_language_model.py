@@ -3,7 +3,14 @@ import os
 import sys
 from typing import List, Tuple
 
-sys.path.append("python")
+# Ensure repo root and python/ are on sys.path when executed as a script
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, os.pardir))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+PYTHON_DIR = os.path.join(ROOT, "python")
+if PYTHON_DIR not in sys.path:
+    sys.path.insert(0, PYTHON_DIR)
 
 import numpy as np
 
@@ -155,4 +162,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
