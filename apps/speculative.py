@@ -56,7 +56,7 @@ def _argmax_last(logits_2d: np.ndarray) -> int:
 
 class SpeculativeDecoder:
     def __init__(self, vocab_size=1000, max_seq_len=128, k=3, device=None, draft_model: nn.Module=None, verify_model: nn.Module=None,
-                 draft_embed: int = 96, draft_layers: int = 1, verify_embed: int = 128, verify_layers: int = 2, num_heads: int = 4):
+                 draft_embed: int = 256, draft_layers: int = 2, verify_embed: int = 512, verify_layers: int = 4, num_heads: int = 8):
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.k = k
@@ -292,7 +292,8 @@ def run_copy_demo(args):
     max_len = args.max_seq_len
     decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device,
                                  draft_embed=args.draft_embed, draft_layers=args.draft_layers,
-                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers)
+                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers,
+                                 num_heads=args.num_heads)
     print(f"Using device: {device}")
 
     # Optional: quick copy-task training to improve acceptance
@@ -483,7 +484,8 @@ def run_char_demo(args):
     max_len = args.max_seq_len
     decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device,
                                  draft_embed=args.draft_embed, draft_layers=args.draft_layers,
-                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers)
+                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers,
+                                 num_heads=args.num_heads)
     print(f"Using device: {device}")
 
     # Train both models on char LM
@@ -528,7 +530,8 @@ def run_word_demo(args):
     max_len = args.max_seq_len
     decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device,
                                  draft_embed=args.draft_embed, draft_layers=args.draft_layers,
-                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers)
+                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers,
+                                 num_heads=args.num_heads)
     print(f"Using device: {device}")
 
     # Train both models on word LM
@@ -571,18 +574,19 @@ def main_demo():
     parser.add_argument("--profile-k", action="store_true")
     parser.add_argument("--ks", type=int, nargs="*", default=None)
     parser.add_argument("--ptb-path", type=str, default="")
-    parser.add_argument("--vocab-size", type=int, default=1000)
-    parser.add_argument("--word-vocab-size", type=int, default=10000, help="vocab cap for word tokenizer mode")
+    parser.add_argument("--vocab-size", type=int, default=5000)
+    parser.add_argument("--word-vocab-size", type=int, default=30000, help="vocab cap for word tokenizer mode")
     parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--align-steps", type=int, default=0, help="extra alignment steps (KD) for draft vs verifier (char mode)")
     parser.add_argument("--align-alpha", type=float, default=0.5, help="weight on true CE vs teacher CE in alignment (char mode)")
     parser.add_argument("--align-temp", type=float, default=1.0, help="temperature for teacher softmax in alignment")
-    parser.add_argument("--draft-embed", type=int, default=96)
-    parser.add_argument("--verify-embed", type=int, default=128)
-    parser.add_argument("--draft-layers", type=int, default=1)
-    parser.add_argument("--verify-layers", type=int, default=2)
+    parser.add_argument("--draft-embed", type=int, default=256)
+    parser.add_argument("--verify-embed", type=int, default=512)
+    parser.add_argument("--draft-layers", type=int, default=2)
+    parser.add_argument("--verify-layers", type=int, default=4)
+    parser.add_argument("--num-heads", type=int, default=8)
     args = parser.parse_args()
 
     if args.mode == "copy":
