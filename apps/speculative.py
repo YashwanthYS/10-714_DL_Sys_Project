@@ -321,12 +321,154 @@ def run_copy_demo(args):
 
 
 
+class SimpleWordTokenizer:
+    def __init__(self, text: str, lowercase: bool = True, vocab_cap: int = 5000):
+        if lowercase:
+            text = text.lower()
+        toks = text.split()
+        # count
+        freq = {}
+        for t in toks:
+            freq[t] = freq.get(t, 0) + 1
+        specials = ["<unk>"]
+        words = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+        vocab = specials + [w for w, _ in words]
+        if vocab_cap is not None:
+            vocab = vocab[:vocab_cap]
+        self.itos = vocab
+        self.stoi = {w: i for i, w in enumerate(vocab)}
+
+    @property
+    def vocab_size(self):
+        return len(self.itos)
+
+    def encode(self, text: str) -> List[int]:
+        toks = text.lower().split()
+        unk = self.stoi.get("<unk>")
+        return [self.stoi.get(t, unk) for t in toks]
+
+    def decode(self, ids: List[int]) -> str:
+        return " ".join(self.itos[i % len(self.itos)] for i in ids)
+
+
+class WordLMTrainer:
+    def __init__(self, device=None):
+        self.device = device if device is not None else _best_device()
+
+    def train_model(self, model: nn.Module, data_ids: np.ndarray, vocab_size: int, seq_len: int = 16, batch_size: int = 8, steps: int = 500, lr: float = 1e-3, name: str = "train"):
+        optim = ndl.optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
+        loss_fn = nn.SoftmaxLoss()
+        N = data_ids.shape[0]
+        model.train()
+        start = time.perf_counter()
+        last_bucket = -1
+        for it in range(steps):
+            if N <= seq_len:
+                start_idx = [0] * batch_size
+            else:
+                start_idx = np.random.randint(0, N - seq_len - 1, size=(batch_size,))
+            batch_x = np.stack([data_ids[s: s + seq_len] for s in start_idx], axis=0)
+            inp = batch_x[:, :-1]
+            tgt = batch_x[:, 1:]
+            inp_t = Tensor(inp.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
+            tgt_t = Tensor(tgt.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
+            logits, _ = model(inp_t)
+            B, Tm1, V = logits.shape
+            loss = loss_fn(logits.reshape((B * Tm1, V)), tgt_t.reshape((B * Tm1,)))
+            optim.reset_grad()
+            loss.backward()
+            optim.step()
+            bucket = int((it + 1) * 20 / steps)
+            if bucket != last_bucket or it + 1 == steps:
+                last_bucket = bucket
+                print(f"[{name}] step {it+1}/{steps}, loss={_to_float(loss):.4f}, {_fmt_eta(start, it+1, steps)}")
+
+    def align_argmax(self, decoder: 'SpeculativeDecoder', data_ids: np.ndarray, vocab_size: int, seq_len: int = 16, batch_size: int = 8, steps: int = 200, lr: float = 1e-3):
+        optim = ndl.optim.Adam(decoder.draft.parameters(), lr=lr, weight_decay=0.0)
+        ce = nn.SoftmaxLoss()
+        N = data_ids.shape[0]
+        start = time.perf_counter()
+        last_bucket = -1
+        for it in range(steps):
+            if N <= seq_len:
+                start_idx = [0] * batch_size
+            else:
+                start_idx = np.random.randint(0, N - seq_len - 1, size=(batch_size,))
+            batch_x = np.stack([data_ids[s: s + seq_len] for s in start_idx], axis=0)
+            inp = batch_x[:, :-1]
+            tgt = batch_x[:, 1:]
+            inp_t = Tensor(inp.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
+            tgt_t = Tensor(tgt.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
+            with np.errstate(all='ignore'):
+                lv, _ = decoder.verify(inp_t)
+            teacher = np.argmax(lv.numpy(), axis=2).astype(np.float32)
+            teacher_t = Tensor(teacher, device=self.device, dtype="float32", requires_grad=False)
+            ld, _ = decoder.draft(inp_t)
+            B, Tm1, V = ld.shape
+            loss = ce(ld.reshape((B * Tm1, V)), teacher_t.reshape((B * Tm1,)))
+            optim.reset_grad()
+            loss.backward()
+            optim.step()
+            bucket = int((it + 1) * 20 / steps)
+            if bucket != last_bucket or it + 1 == steps:
+                last_bucket = bucket
+                print(f"[align] step {it+1}/{steps}, loss={_to_float(loss):.4f}, {_fmt_eta(start, it+1, steps)}")
+
+
+def run_toy_demo(args):
+    np.random.seed(args.seed)
+    device = _best_device()
+    # Load or build tiny corpus
+    path = args.toy_corpus if args.toy_corpus else os.path.join("data", "toy_corpus.txt")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = "the quick brown fox jumps over the lazy dog\n" * 200
+    tok = SimpleWordTokenizer(text, lowercase=True, vocab_cap=args.vocab_cap)
+    data_ids = np.array(tok.encode(text), dtype=np.int32)
+    vocab = tok.vocab_size
+    max_len = args.max_seq_len
+    decoder = SpeculativeDecoder(vocab_size=vocab, max_seq_len=max_len, k=args.k, device=device,
+                                 draft_embed=args.draft_embed, draft_layers=args.draft_layers,
+                                 verify_embed=args.verify_embed, verify_layers=args.verify_layers,
+                                 num_heads=args.num_heads)
+    print(f"Using device: {device}")
+
+    # Train on toy LM
+    trainer = WordLMTrainer(device=device)
+    trainer.train_model(decoder.draft, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="draft")
+    trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="verify")
+    if args.align_steps > 0:
+        trainer.align_argmax(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.align_steps, lr=args.lr)
+
+    # Prompt and decode
+    prompt_text = args.prompt if args.prompt else "the quick brown fox"
+    prompt_ids = tok.encode(prompt_text)
+    out, metrics = decoder.decode(prompt_ids, gen_tokens=args.gen_tokens)
+    print("Prompt text:", prompt_text)
+    print("Prompt ids:", prompt_ids)
+    print("Output (ids):", out)
+    print("Output text:", tok.decode(out))
+    print("Metrics:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+
+    if args.profile_k:
+        ks = args.ks if args.ks else [2,3,4]
+        print(f"\nProfile across k in {ks}:")
+        table = profile_k(decoder, prompt_ids, gen_tokens=args.gen_tokens, ks=ks)
+        for row in table:
+            print(f"  k={row['k']}: tokens/sec={row['toks_per_s']:.2f}, acceptance={row['accept_rate']:.2f}, p50_ms={row['p50_ms']:.1f}")
+
+
 def main_demo():
-    parser = argparse.ArgumentParser(description="Speculative decoding demo (copy mode only)")
+    parser = argparse.ArgumentParser(description="Speculative decoding demo")
+    parser.add_argument("--mode", choices=["copy", "toy"], default="copy")
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--steps", type=int, default=200)
-    parser.add_argument("--seq-len", type=int, default=32)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--seq-len", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gen-tokens", type=int, default=64)
     parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--profile-k", action="store_true")
@@ -340,9 +482,16 @@ def main_demo():
     parser.add_argument("--draft-layers", type=int, default=1)
     parser.add_argument("--verify-layers", type=int, default=2)
     parser.add_argument("--num-heads", type=int, default=4)
+    # toy mode extras
+    parser.add_argument("--toy-corpus", type=str, default="", help="path to simple corpus text (optional)")
+    parser.add_argument("--vocab-cap", type=int, default=5000)
+    parser.add_argument("--align-steps", type=int, default=200)
     args = parser.parse_args()
 
-    run_copy_demo(args)
+    if args.mode == "copy":
+        run_copy_demo(args)
+    else:
+        run_toy_demo(args)
 
 
 if __name__ == "__main__":
