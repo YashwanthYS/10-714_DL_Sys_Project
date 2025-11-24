@@ -540,15 +540,15 @@ def run_toy_demo(args):
                                  num_heads=args.num_heads)
     print(f"Using device: {device}")
 
-    # Optional: init draft from verify to boost acceptance if dims match
-    if args.init_draft_from_verify:
-        copied = _init_draft_from_verify(decoder)
-        print("Initialized draft from verify:" , copied)
-
-    # Train on toy LM
+    # Default training order for better acceptance:
+    # 1) Train VERIFY first
+    # 2) Initialize DRAFT from VERIFY (same embed dim recommended)
+    # 3) Align DRAFT to VERIFY (KD or argmax)
     trainer = WordLMTrainer(device=device)
-    trainer.train_model(decoder.draft, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="draft")
-    trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="verify")
+    if args.steps > 0:
+        trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="verify")
+    copied = _init_draft_from_verify(decoder)
+    print("Initialized draft from verify:", copied)
     if args.align_steps > 0:
         if args.align_mode == "kd":
             trainer.align_kd(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.align_steps, lr=args.lr, alpha=args.align_alpha, temperature=args.align_temp)
