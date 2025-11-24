@@ -127,29 +127,36 @@ class SpeculativeDecoder:
 
     def verify_block(self, block: List[int]) -> Tuple[int, int, List[int]]:
         """
-        Strict verifier: step token-by-token with KV cache to avoid alignment issues.
-        Returns (match_len, mismatch_token, preds_seen) where preds_seen are the verifier's
-        greedy predictions at each step.
+        Step-through verifier aligned to next-token semantics:
+        - Compare the first drafted token to the verifier's stored next-token prediction
+          (from warmup or previous step) without consuming any input.
+        - If it matches, feed that token to advance cache and compute the next prediction.
+        - Repeat for subsequent tokens.
+        Returns (match_len, mismatch_token, preds_used), where preds_used are the
+        verifier predictions that each drafted token was checked against.
         """
-        preds_seen: List[int] = []
+        preds_used: List[int] = []
         m = 0
         mismatch_tok = -1
+        # Ensure we have a current next-token prediction
+        cur_pred = self._v_next_pred
         for t in block:
-            inp = _to_tensor_ids([t], self.device)
-            logits, new_cache_v = self.verify(inp, self.cache_v)
-            pred = _argmax_last(logits.numpy()[:, -1, :])
-            preds_seen.append(pred)
-            # advance cache regardless; verifier has now consumed this token
-            self.cache_v = new_cache_v
-            if pred == t:
-                m += 1
-            else:
-                mismatch_tok = pred
+            if cur_pred is None:
+                # compute from a zero-length? fallback: force compute by feeding a dummy no-op not possible; treat as mismatch
+                mismatch_tok = -1
                 break
-        # store next-token prediction for the next block if fully matched
-        if m == len(block):
-            self._v_next_pred = pred  # last pred equals next-token after last consumed
-        return m, mismatch_tok, preds_seen
+            preds_used.append(cur_pred)
+            if t != cur_pred:
+                mismatch_tok = cur_pred
+                break
+            # token accepted: feed it to advance and get next prediction
+            inp = _to_tensor_ids([t], self.device)
+            logits, self.cache_v = self.verify(inp, self.cache_v)
+            cur_pred = _argmax_last(logits.numpy()[:, -1, :])
+            m += 1
+        # update stored next prediction for future blocks
+        self._v_next_pred = cur_pred
+        return m, mismatch_tok, preds_used
 
     def truncate_cache(self, cache, new_len):
         # Helper to truncate list-based caches to target length
