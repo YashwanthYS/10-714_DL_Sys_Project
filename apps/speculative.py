@@ -10,6 +10,7 @@ sys.path.append("python")
 
 import needle as ndl
 import needle.nn as nn
+from needle import ops
 from needle.autograd import Tensor
 
 
@@ -414,17 +415,121 @@ class WordLMTrainer:
                 last_bucket = bucket
                 print(f"[align] step {it+1}/{steps}, loss={_to_float(loss):.4f}, {_fmt_eta(start, it+1, steps)}")
 
+    def align_kd(self, decoder: 'SpeculativeDecoder', data_ids: np.ndarray, vocab_size: int, seq_len: int = 16, batch_size: int = 8, steps: int = 200, lr: float = 1e-3, alpha: float = 0.3, temperature: float = 2.0):
+        """Knowledge Distillation: match draft to verify using soft targets.
+        Loss = alpha * CE(draft, true) + (1-alpha) * KL(teacher || student) at temperature.
+        """
+        optim = ndl.optim.Adam(decoder.draft.parameters(), lr=lr, weight_decay=0.0)
+        ce = nn.SoftmaxLoss()
+        N = data_ids.shape[0]
+        start = time.perf_counter()
+        last_bucket = -1
+        for it in range(steps):
+            if N <= seq_len:
+                start_idx = [0] * batch_size
+            else:
+                start_idx = np.random.randint(0, N - seq_len - 1, size=(batch_size,))
+            batch_x = np.stack([data_ids[s: s + seq_len] for s in start_idx], axis=0)
+            inp = batch_x[:, :-1]
+            tgt = batch_x[:, 1:]
+            inp_t = Tensor(inp.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
+            tgt_t = Tensor(tgt.astype(np.float32), device=self.device, dtype="float32", requires_grad=False)
+
+            # Teacher logits (no grad) -> soft probs
+            with np.errstate(all='ignore'):
+                logits_v, _ = decoder.verify(inp_t)
+            Bv, Tv, V = logits_v.shape
+            lv2 = logits_v.reshape((Bv * Tv, V)) / float(temperature)
+            logsum_t = ops.logsumexp(lv2, axes=(1,)).reshape((Bv * Tv, 1))
+            teacher_log_probs = lv2 - ops.broadcast_to(logsum_t, lv2.shape)
+            teacher_probs = ops.exp(teacher_log_probs).detach()
+
+            # Student logits
+            logits_d, _ = decoder.draft(inp_t)
+            B, Tm1, V = logits_d.shape
+            ld2 = logits_d.reshape((B * Tm1, V)) / float(temperature)
+            logsum_s = ops.logsumexp(ld2, axes=(1,)).reshape((B * Tm1, 1))
+            student_log_probs = ld2 - ops.broadcast_to(logsum_s, ld2.shape)
+
+            # Hard CE and soft KL
+            loss_true = ce(logits_d.reshape((B * Tm1, V)), tgt_t.reshape((B * Tm1,)))
+            # KL(teacher||student) = sum p_t * (log p_t - log p_s)
+            kl = ops.summation(teacher_probs * (teacher_log_probs - student_log_probs)) / (B * Tm1)
+            loss = loss_true * alpha + kl * (1.0 - alpha) * (temperature * temperature)
+
+            optim.reset_grad()
+            loss.backward()
+            optim.step()
+
+            bucket = int((it + 1) * 20 / steps)
+            if bucket != last_bucket or it + 1 == steps:
+                last_bucket = bucket
+                print(f"[align-kd] step {it+1}/{steps}, loss={_to_float(loss):.4f}, {_fmt_eta(start, it+1, steps)}")
+
+
+def _init_draft_from_verify(decoder: 'SpeculativeDecoder') -> bool:
+    """Copy overlapping weights from verify into draft to jump-start agreement.
+    Only works when embedding dims and head dims match; copies first N draft layers.
+    Returns True if copied, else False.
+    """
+    d = decoder.draft
+    v = decoder.verify
+    ok = True
+    try:
+        # token and positional embeddings must match dims
+        if d.embed_dim != v.embed_dim:
+            return False
+        # copy embeddings
+        d.token_embedding.weight.data = v.token_embedding.weight.data
+        d.pos_embedding.weight.data = v.pos_embedding.weight.data
+        # copy first len(d.layers) transformer blocks
+        for dl, vl in zip(d.layers, v.layers):
+            dl.ln1.weight.data = vl.ln1.weight.data
+            dl.ln1.bias.data = vl.ln1.bias.data
+            dl.attn.q_proj.weight.data = vl.attn.q_proj.weight.data
+            dl.attn.k_proj.weight.data = vl.attn.k_proj.weight.data
+            dl.attn.v_proj.weight.data = vl.attn.v_proj.weight.data
+            dl.attn.out_proj.weight.data = vl.attn.out_proj.weight.data
+            dl.ln2.weight.data = vl.ln2.weight.data
+            dl.ln2.bias.data = vl.ln2.bias.data
+            dl.ff1.weight.data = vl.ff1.weight.data
+            dl.ff2.weight.data = vl.ff2.weight.data
+        d.ln_f.weight.data = v.ln_f.weight.data
+        d.ln_f.bias.data = v.ln_f.bias.data
+        return ok
+    except Exception:
+        return False
+
 
 def run_toy_demo(args):
     np.random.seed(args.seed)
     device = _best_device()
-    # Load or build tiny corpus
-    path = args.toy_corpus if args.toy_corpus else os.path.join("data", "toy_corpus.txt")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+    # Load or build tiny corpus (prefer shakespeare_2k if present, else create from shakespeare.txt)
+    if args.toy_corpus:
+        path = args.toy_corpus
     else:
-        text = "the quick brown fox jumps over the lazy dog\n" * 200
+        path = os.path.join("data", "shakespeare_2k.txt")
+        if not os.path.exists(path):
+            full = os.path.join("data", "shakespeare.txt")
+            if os.path.exists(full):
+                try:
+                    with open(full, "r", encoding="utf-8") as fin, open(path, "w", encoding="utf-8") as fout:
+                        for i, line in enumerate(fin):
+                            if i >= 2000:
+                                break
+                            fout.write(line)
+                    print(f"Created subset corpus: {path}")
+                except Exception:
+                    pass
+        if not os.path.exists(path):
+            # fallback tiny toy text
+            path = os.path.join("data", "toy_corpus.txt")
+            if not os.path.exists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(("the quick brown fox jumps over the lazy dog\n") * 200)
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
     tok = SimpleWordTokenizer(text, lowercase=True, vocab_cap=args.vocab_cap)
     data_ids = np.array(tok.encode(text), dtype=np.int32)
     vocab = tok.vocab_size
@@ -435,12 +540,20 @@ def run_toy_demo(args):
                                  num_heads=args.num_heads)
     print(f"Using device: {device}")
 
+    # Optional: init draft from verify to boost acceptance if dims match
+    if args.init_draft_from_verify:
+        copied = _init_draft_from_verify(decoder)
+        print("Initialized draft from verify:" , copied)
+
     # Train on toy LM
     trainer = WordLMTrainer(device=device)
     trainer.train_model(decoder.draft, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="draft")
     trainer.train_model(decoder.verify, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.steps, lr=args.lr, name="verify")
     if args.align_steps > 0:
-        trainer.align_argmax(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.align_steps, lr=args.lr)
+        if args.align_mode == "kd":
+            trainer.align_kd(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.align_steps, lr=args.lr, alpha=args.align_alpha, temperature=args.align_temp)
+        else:
+            trainer.align_argmax(decoder, data_ids, vocab, seq_len=args.seq_len, batch_size=args.batch_size, steps=args.align_steps, lr=args.lr)
 
     # Prompt and decode
     prompt_text = args.prompt if args.prompt else "the quick brown fox"
@@ -477,8 +590,8 @@ def main_demo():
     parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--draft-embed", type=int, default=96)
-    parser.add_argument("--verify-embed", type=int, default=128)
+    parser.add_argument("--draft-embed", type=int, default=256)
+    parser.add_argument("--verify-embed", type=int, default=256)
     parser.add_argument("--draft-layers", type=int, default=1)
     parser.add_argument("--verify-layers", type=int, default=2)
     parser.add_argument("--num-heads", type=int, default=4)
@@ -486,6 +599,10 @@ def main_demo():
     parser.add_argument("--toy-corpus", type=str, default="", help="path to simple corpus text (optional)")
     parser.add_argument("--vocab-cap", type=int, default=5000)
     parser.add_argument("--align-steps", type=int, default=200)
+    parser.add_argument("--align-mode", choices=["kd","argmax"], default="kd")
+    parser.add_argument("--align-alpha", type=float, default=0.3)
+    parser.add_argument("--align-temp", type=float, default=2.0)
+    parser.add_argument("--init-draft-from-verify", action="store_true")
     args = parser.parse_args()
 
     if args.mode == "copy":

@@ -14,6 +14,16 @@ from .nn_basic import (
 )
 from .nn_sequence import Embedding
 
+def _gelu(x: Tensor) -> Tensor:
+    """GELU activation (tanh approximation)."""
+    # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x^3)))
+    # constants as Python floats to trigger scalar ops in Needle
+    c0 = 0.044715
+    c1 = float(np.sqrt(2.0 / np.pi))
+    x3 = ops.power_scalar(x, 3)
+    inner = x + x3 * c0
+    return x * 0.5 * (1.0 + ops.tanh(inner * c1))
+
 
 def _batched_matmul(a: Tensor, bT: Tensor) -> Tensor:
     """
@@ -187,11 +197,12 @@ class GPTBlock(Module):
         y2 = x.reshape((B * T, D))
         y2 = self.ln2(y2)
         y2 = self.ff1(y2)
-        # Use ReLU as simple activation
-        y2 = ops.relu(y2)
+        # Use GELU activation for smoother gradients
+        y2 = _gelu(y2)
+        # Single residual dropout in MLP branch
         y2 = self.dropout(y2)
         y2 = self.ff2(y2)
-        y2 = self.dropout(y2).reshape((B, T, D))
+        y2 = y2.reshape((B, T, D))
         x = x + y2
         return x, new_cache
 
@@ -261,7 +272,8 @@ class GPTModel(Module):
             pos_offset = len(cache[0]["k"])  # tokens already cached
         # Positional indices shape (T, B) with offset
         pos_idx = np.tile((np.arange(T, dtype=np.int32) + pos_offset).reshape(T, 1), (1, B))
-        pos = Tensor(pos_idx.astype("float32"), device=tok_TBD.device, dtype="float32", requires_grad=False)
+        # Embedding expects integer indices
+        pos = Tensor(pos_idx.astype("int32"), device=tok_TBD.device, dtype="int32", requires_grad=False)
         pos_emb = self.pos_embedding(pos)
         pos_emb = ops.transpose(pos_emb, axes=(0, 1))  # (B, T, D)
         h = ops.transpose(tok_TBD, axes=(0, 1))  # (B, T, D)
