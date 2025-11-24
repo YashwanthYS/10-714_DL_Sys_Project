@@ -272,8 +272,8 @@ class GPTModel(Module):
             pos_offset = len(cache[0]["k"])  # tokens already cached
         # Positional indices shape (T, B) with offset
         pos_idx = np.tile((np.arange(T, dtype=np.int32) + pos_offset).reshape(T, 1), (1, B))
-        # Embedding expects integer indices
-        pos = Tensor(pos_idx.astype("int32"), device=tok_TBD.device, dtype="int32", requires_grad=False)
+        # Needle NDArray backend stores tensors as float32; Embedding internally casts to int indices.
+        pos = Tensor(pos_idx.astype("float32"), device=tok_TBD.device, dtype="float32", requires_grad=False)
         pos_emb = self.pos_embedding(pos)
         pos_emb = ops.transpose(pos_emb, axes=(0, 1))  # (B, T, D)
         h = ops.transpose(tok_TBD, axes=(0, 1))  # (B, T, D)
