@@ -100,6 +100,7 @@ class SpeculativeDecoder:
 
         self.cache_d = self.draft.init_cache(batch_size=1)
         self.cache_v = self.verify.init_cache(batch_size=1)
+        self._v_next_pred: Optional[int] = None
 
     def reset_caches(self):
         self.cache_d = self.draft.init_cache(batch_size=1)
@@ -108,8 +109,10 @@ class SpeculativeDecoder:
     def warmup(self, prompt_ids: List[int]):
         # Advance both caches on the prompt in one block
         inp = _to_tensor_ids(prompt_ids, self.device)
-        _, self.cache_d = self.draft(inp, self.cache_d)
-        _, self.cache_v = self.verify(inp, self.cache_v)
+        logits_d, self.cache_d = self.draft(inp, self.cache_d)
+        logits_v, self.cache_v = self.verify(inp, self.cache_v)
+        # store verifier's next-token prediction after the prompt (last position)
+        self._v_next_pred = _argmax_last(logits_v.numpy()[:, -1, :])
 
     def draft_step(self, cur_id: int, max_steps: int) -> Tuple[List[int], List[Tensor]]:
         tokens: List[int] = []
@@ -133,14 +136,26 @@ class SpeculativeDecoder:
         preds = np.argmax(logits.numpy(), axis=2).astype(int).reshape(-1).tolist()
         m = 0
         mismatch_tok = -1
-        for i, (d, v) in enumerate(zip(block, preds)):
-            if d == v:
-                m += 1
+        # First token in block should match verifier's next-token prediction before seeing it
+        if len(block) > 0:
+            v0 = self._v_next_pred if self._v_next_pred is not None else -1
+            if block[0] == v0:
+                m = 1
             else:
-                mismatch_tok = v
-                break
-        # tentatively set cache to the full block advance; caller may truncate
+                mismatch_tok = v0
+        # For subsequent tokens i>=1, compare block[i] to preds[i-1]
+        if mismatch_tok < 0:
+            for i in range(1, len(block)):
+                v = preds[i - 1]
+                if block[i] == v:
+                    m += 1
+                else:
+                    mismatch_tok = v
+                    break
+        # Update cache and the verifier's next-token prediction after this block
         self.cache_v = new_cache_v
+        if len(preds) > 0:
+            self._v_next_pred = preds[-1]
         return m, mismatch_tok, preds
 
     def truncate_cache(self, cache, new_len):
