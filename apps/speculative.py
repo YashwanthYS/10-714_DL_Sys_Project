@@ -167,7 +167,11 @@ class SpeculativeDecoder:
                 lv["v"] = lv["v"][:new_len]
 
     def decode(self, prompt_ids: List[int], gen_tokens: int = 64) -> Tuple[List[int], dict]:
+        # ensure deterministic inference
+        self.draft.eval()
+        self.verify.eval()
         self.reset_caches()
+        self._v_next_pred = None
         self.warmup(prompt_ids)
         out = list(prompt_ids)
         accepted = 0
