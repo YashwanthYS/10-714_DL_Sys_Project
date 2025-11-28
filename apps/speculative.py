@@ -1,5 +1,5 @@
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import argparse
 import os
 
@@ -101,28 +101,44 @@ class SpeculativeDecoder:
         self.cache_d = self.draft.init_cache(batch_size=1)
         self.cache_v = self.verify.init_cache(batch_size=1)
         self._v_next_pred: Optional[int] = None
+        self._d_next_pred: Optional[int] = None
 
     def reset_caches(self):
         self.cache_d = self.draft.init_cache(batch_size=1)
         self.cache_v = self.verify.init_cache(batch_size=1)
 
     def warmup(self, prompt_ids: List[int]):
-        # Advance both caches on the prompt in one block
-        inp = _to_tensor_ids(prompt_ids, self.device)
-        logits_d, self.cache_d = self.draft(inp, self.cache_d)
-        logits_v, self.cache_v = self.verify(inp, self.cache_v)
-        # store verifier's next-token prediction after the prompt (last position)
-        self._v_next_pred = _argmax_last(logits_v.numpy()[:, -1, :])
+        # Ingest all but last token into caches
+        if len(prompt_ids) > 1:
+            inp_hist = _to_tensor_ids(prompt_ids[:-1], self.device)
+            _, self.cache_d = self.draft(inp_hist, self.cache_d)
+            _, self.cache_v = self.verify(inp_hist, self.cache_v)
+        # Feed last token once to establish next-token predictions
+        if len(prompt_ids) > 0:
+            last = prompt_ids[-1]
+            inp_last = _to_tensor_ids([last], self.device)
+            logits_d, self.cache_d = self.draft(inp_last, self.cache_d)
+            logits_v, self.cache_v = self.verify(inp_last, self.cache_v)
+            self._d_next_pred = _argmax_last(logits_d.numpy()[:, -1, :])
+            self._v_next_pred = _argmax_last(logits_v.numpy()[:, -1, :])
 
     def draft_step(self, cur_id: int, max_steps: int) -> Tuple[List[int], List[Tensor]]:
+        # Generate up to max_steps tokens using next-token prediction state
         tokens: List[int] = []
+        # bootstrap next prediction if missing by feeding cur_id once
+        if self._d_next_pred is None:
+            inp0 = _to_tensor_ids([cur_id], self.device)
+            logits, self.cache_d = self.draft(inp0, self.cache_d)
+            self._d_next_pred = _argmax_last(logits.numpy()[:, -1, :])
         for _ in range(max_steps):
-            inp = _to_tensor_ids([cur_id], self.device)
+            t = self._d_next_pred
+            if t is None:
+                break
+            tokens.append(t)
+            # advance with t and update next pred
+            inp = _to_tensor_ids([t], self.device)
             logits, self.cache_d = self.draft(inp, self.cache_d)
-            # logits shape (1,1,V)
-            nxt = _argmax_last(logits.numpy()[:, -1, :])
-            tokens.append(nxt)
-            cur_id = nxt
+            self._d_next_pred = _argmax_last(logits.numpy()[:, -1, :])
         return tokens, []
 
     def verify_block(self, block: List[int]) -> Tuple[int, int, List[int]]:
@@ -172,48 +188,43 @@ class SpeculativeDecoder:
         self.verify.eval()
         self.reset_caches()
         self._v_next_pred = None
+        self._d_next_pred = None
         self.warmup(prompt_ids)
         out = list(prompt_ids)
         accepted = 0
         verify_latencies = []
         while len(out) < len(prompt_ids) + gen_tokens and len(out) < self.max_seq_len:
-            # Draft up to k tokens from D
-            cur = out[-1]
-            prev_len = len(self.cache_d[0]["k"]) if self.cache_d and self.cache_d[0]["k"] else 0
-            block, _ = self.draft_step(cur, min(self.k, self.max_seq_len - len(out)))
-
-            # Verify once in V
+            # 1) Draft proposes a block up to k
+            cur_id = out[-1] if out else 0
+            prev_len = 0
+            if self.cache_d and self.cache_d[0].get("k"):
+                prev_len = len(self.cache_d[0]["k"])  # cache length before proposal
+            steps = min(self.k, self.max_seq_len - len(out))
+            proposed, _ = self.draft_step(cur_id, steps)
+            if not proposed:
+                break
+            # 2) Verify the proposed block in one pass (advances verify cache only for accepted prefix)
             t0 = time.perf_counter()
-            match_len, mismatch_tok, _ = self.verify_block(block)
+            match_len, mismatch_tok, _ = self.verify_block(proposed)
             verify_latencies.append((time.perf_counter() - t0) * 1000.0)
-
-            if match_len == len(block):
-                # Accept all
-                out.extend(block)
+            # 3) Accept the matched prefix
+            if match_len > 0:
+                out.extend(proposed[:match_len])
                 accepted += match_len
-            else:
-                # Accept prefix, then take V's token at mismatch
-                accepted += match_len
-                # Truncate caches back to prev_len + match_len
-                self.truncate_cache(self.cache_v, prev_len + match_len)
-                self.truncate_cache(self.cache_d, prev_len)
-
-                # Advance D on accepted prefix (feed each accepted token)
-                for t in block[:match_len]:
-                    inp = _to_tensor_ids([t], self.device)
-                    _, self.cache_d = self.draft(inp, self.cache_d)
-                    out.append(t)
-
-                # Step V on mismatch token to commit it
+            # 4) Truncate draft cache back to accepted prefix (discard unaccepted tail)
+            new_len = prev_len + match_len
+            self.truncate_cache(self.cache_d, new_len)
+            # Invalidate draft next-pred; will be recomputed on next draft_step
+            self._d_next_pred = None
+            # 5) On mismatch, commit verifier token and advance both models
+            if match_len < len(proposed):
                 if mismatch_tok >= 0 and len(out) < self.max_seq_len:
-                    inp_v = _to_tensor_ids([mismatch_tok], self.device)
-                    _, self.cache_v = self.verify(inp_v, self.cache_v)
-
-                    # Also advance D on the mismatch token
-                    inp_d = _to_tensor_ids([mismatch_tok], self.device)
-                    _, self.cache_d = self.draft(inp_d, self.cache_d)
-
                     out.append(mismatch_tok)
+                    inp = _to_tensor_ids([mismatch_tok], self.device)
+                    logits_d, self.cache_d = self.draft(inp, self.cache_d)
+                    logits_v, self.cache_v = self.verify(inp, self.cache_v)
+                    self._d_next_pred = _argmax_last(logits_d.numpy()[:, -1, :])
+                    self._v_next_pred = _argmax_last(logits_v.numpy()[:, -1, :])
 
         total_new = len(out) - len(prompt_ids)
         tokens_per_sec = total_new / max(1e-6, sum(verify_latencies) / 1000.0) if verify_latencies else 0.0
